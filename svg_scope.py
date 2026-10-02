@@ -1,98 +1,79 @@
 #!/usr/bin/env python3
-"""Report potentially active or external content in an SVG without changing it."""
+"""Find common active-content and resource-reference patterns in an SVG."""
 
 import argparse
 import re
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
-CSS_URL = re.compile(r"url\(\s*([^)]*)\)", re.IGNORECASE)
+MAX_BYTES = 32 * 1024 * 1024
+SVG_TAG = re.compile(r"<\s*(?:[A-Za-z_][\w.-]*:)?svg\b", re.IGNORECASE)
+SCRIPT_TAG = re.compile(r"<\s*(?:[A-Za-z_][\w.-]*:)?script\b", re.IGNORECASE)
+FOREIGN_OBJECT = re.compile(
+    r"<\s*(?:[A-Za-z_][\w.-]*:)?foreignObject\b", re.IGNORECASE
+)
+EVENT_ATTRIBUTE = re.compile(r"\son[a-z][a-z0-9:_-]*\s*=", re.IGNORECASE)
+JAVASCRIPT_URI = re.compile(r"javascript\s*:", re.IGNORECASE)
+HREF = re.compile(
+    r'''\bhref\s*=\s*(?:"([^"]*)"|'([^']*)')''', re.IGNORECASE
+)
+CSS_URL = re.compile(r"\burl\(\s*([^)]*)\)", re.IGNORECASE)
 CSS_IMPORT = re.compile(r"@import\b", re.IGNORECASE)
 
 
-def local_name(value):
-    return value.rsplit("}", 1)[-1].lower()
-
-
 def inspect(path):
+    with path.open("rb") as stream:
+        data = stream.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise ValueError("SVG 文件超过 32 MiB 扫描上限")
+    content = data.decode("utf-8-sig")
+    if not SVG_TAG.search(content):
+        raise ValueError("未找到 SVG 根元素标记")
+
     counts = {
-        "script 元素": 0,
-        "foreignObject 元素": 0,
-        "事件处理器属性": 0,
-        "javascript: 属性值": 0,
-        "非片段 href 引用": 0,
-        "CSS 外部 url() 引用": 0,
-        "CSS @import": 0,
+        "script 元素标记": len(SCRIPT_TAG.findall(content)),
+        "foreignObject 标记": len(FOREIGN_OBJECT.findall(content)),
+        "事件处理器属性": len(EVENT_ATTRIBUTE.findall(content)),
+        "javascript: URI": len(JAVASCRIPT_URI.findall(content)),
+        "非片段 href 引用": sum(
+            not value.strip().startswith("#")
+            for values in HREF.findall(content)
+            for value in values
+            if value
+        ),
+        "CSS 外部 url() 引用": sum(
+            bool(value.strip().strip("\"'").strip())
+            and not value.strip().strip("\"'").strip().startswith("#")
+            for value in CSS_URL.findall(content)
+        ),
+        "CSS @import": len(CSS_IMPORT.findall(content)),
     }
-    elements = 0
-    root_seen = False
-
-    for event, element in ET.iterparse(path, events=("start", "end")):
-        tag = local_name(element.tag)
-        if event == "start":
-            elements += 1
-            if not root_seen:
-                root_seen = True
-                if tag != "svg":
-                    raise ValueError("根 XML 元素不是 SVG")
-            if tag == "script":
-                counts["script 元素"] += 1
-            elif tag == "foreignobject":
-                counts["foreignObject 元素"] += 1
-
-            for name, value in element.attrib.items():
-                attribute = local_name(name)
-                lowered = value.strip().lower()
-                if attribute.startswith("on") and len(attribute) > 2:
-                    counts["事件处理器属性"] += 1
-                if "javascript:" in lowered:
-                    counts["javascript: 属性值"] += 1
-                if attribute == "href" and lowered and not lowered.startswith("#"):
-                    counts["非片段 href 引用"] += 1
-                if attribute == "style":
-                    count_css_references(value, counts)
-        elif tag == "style" and element.text:
-            count_css_references(element.text, counts)
-        if event == "end":
-            element.clear()
-
-    if not root_seen:
-        raise ValueError("SVG 文件为空")
-    print(f"已扫描 {elements} 个 XML 元素。")
+    print("扫描 SVG 文本中的常见风险标记；没有解析 XML 或访问外部资源。")
     findings = sum(counts.values())
     for label, count in counts.items():
         if count:
             print(f"需留意：{label} {count} 处")
     if not findings:
-        print("未发现已识别的活动内容或外部引用；静态扫描不能证明文件安全。")
+        print("未发现已识别标记；文本扫描不能证明文件安全。")
     return findings
-
-
-def count_css_references(value, counts):
-    for match in CSS_URL.finditer(value):
-        reference = match.group(1).strip().strip("\"'").lower()
-        if reference and not reference.startswith("#"):
-            counts["CSS 外部 url() 引用"] += 1
-    counts["CSS @import"] += len(CSS_IMPORT.findall(value))
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="扫描 SVG 中可能执行脚本或加载外部资源的标记，不执行、不改写文件。"
+        description="扫描 SVG 文本中的常见活动内容与资源引用，不解析、不执行、不改写文件。"
     )
-    parser.add_argument("svg", help="SVG 文件路径")
+    parser.add_argument("svg", help="UTF-8 编码且不超过 32 MiB 的 SVG 文件")
     args = parser.parse_args(argv)
     path = Path(args.svg).expanduser()
     try:
         return 1 if inspect(path) else 0
-    except (OSError, UnicodeError, ET.ParseError, ValueError) as error:
+    except (OSError, UnicodeError, ValueError) as error:
         message = "".join(
             char if char.isprintable() else char.encode("unicode_escape").decode("ascii")
             for char in str(error)
         )
-        print(f"svg-scope: 无法读取 SVG：{message}", file=sys.stderr)
+        print(f"svg-scope: 无法扫描 SVG：{message}", file=sys.stderr)
         return 2
 
 
